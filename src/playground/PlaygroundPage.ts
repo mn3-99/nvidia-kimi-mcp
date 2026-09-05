@@ -9,92 +9,75 @@ export class PlaygroundPage {
     this.page = page || browserManager.getPage();
   }
 
-  private async findFirst(selectors: string[]): Promise<Locator | null> {
-    for (const sel of selectors) {
-      try {
-        const loc = this.page.locator(sel).first();
-        if (await loc.isVisible({ timeout: 1000 })) return loc;
-      } catch {}
+  private async nativeClick(text: string): Promise<boolean> {
+    const coords = await this.page.evaluate((text) => {
+      const btns = Array.from(document.querySelectorAll('button'));
+      const btn = btns.find(b => b.textContent?.includes(text));
+      if (!btn) return null;
+      const r = btn.getBoundingClientRect();
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    }, text);
+    if (coords) {
+      await this.page.mouse.click(coords.x, coords.y);
+      return true;
     }
-    return null;
-  }
-
-  private async removeOverlays(): Promise<void> {
-    // Method 1: Playwright locator click (works with React)
-    try {
-      await this.page.getByText('Acknowledge & Continue').click({ force: true, timeout: 5000 });
-      await this.page.waitForTimeout(2000);
-    } catch {}
-
-    // Method 2: Try clicking by role
-    try {
-      await this.page.getByRole('button', { name: /acknowledge/i }).click({ force: true, timeout: 3000 });
-      await this.page.waitForTimeout(2000);
-    } catch {}
-
-    // Method 3: Try Review Terms
-    try {
-      await this.page.getByText('Review Terms').click({ force: true, timeout: 3000 });
-      await this.page.waitForTimeout(2000);
-    } catch {}
-
-    // Method 4: Accept cookies
-    try {
-      await this.page.getByText('Accept All').click({ force: true, timeout: 3000 });
-      await this.page.waitForTimeout(1000);
-    } catch {}
-    try {
-      await this.page.getByText('Save and Accept').click({ force: true, timeout: 3000 });
-      await this.page.waitForTimeout(1000);
-    } catch {}
-
-    // Method 5: Close any remaining modals by X button
-    try {
-      await this.page.locator('[aria-label*="close" i], [aria-label*="Close"]').first().click({ force: true, timeout: 2000 });
-      await this.page.waitForTimeout(500);
-    } catch {}
-
-    // Method 6: Remove overlay elements
-    await this.page.evaluate(() => {
-      document.querySelectorAll('[class*="backdrop"], [class*="z-40"], [class*="z-50"]').forEach(el => {
-        if (el instanceof HTMLElement) el.remove();
-      });
-    }).catch(() => {});
-    await this.page.waitForTimeout(500);
+    return false;
   }
 
   async sendMessage(message: string): Promise<void> {
-    await this.removeOverlays();
+    // Dismiss any overlays before typing
+    await browserManager.removeOverlays();
 
-    const input = await this.findFirst([
-      'textarea[aria-label="chat prompt"]',
-      'textarea.nv-text-area-element',
-      'textarea',
-    ]);
-    if (!input) throw new Error('Message input not found');
+    // Wait for textarea with retries
+    let textarea: Locator | null = null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      textarea = this.page.locator('textarea[aria-label="chat prompt"]');
+      try {
+        await textarea.waitFor({ state: 'visible', timeout: 5000 });
+        break;
+      } catch {
+        await browserManager.removeOverlays();
+        await this.page.waitForTimeout(2000);
+      }
+    }
+    if (!textarea) throw new Error('Message input not found');
 
     this.lastSentMessage = message;
 
-    await input.click({ force: true });
+    // Type message via native value setter (triggers React state)
+    await textarea.click({ force: true });
     await this.page.waitForTimeout(300);
-    await input.fill('');
-    await this.page.waitForTimeout(300);
-    await input.fill(message);
-    await this.page.waitForTimeout(500);
+    await this.page.evaluate((text) => {
+      const ta = document.querySelector('textarea[aria-label="chat prompt"]');
+      if (!ta) return;
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+      if (setter) setter.call(ta, text);
+      else (ta as HTMLTextAreaElement).value = text;
+      ta.dispatchEvent(new Event('input', { bubbles: true }));
+      ta.dispatchEvent(new Event('change', { bubbles: true }));
+    }, message);
+    await this.page.waitForTimeout(1000);
 
-    // Click Send button
-    for (let i = 0; i < 30; i++) {
-      const btn = await this.findFirst([
-        'button[aria-label="Send"]:not([disabled])',
-        'button[aria-label*="send" i]:not([disabled])',
-      ]);
-      if (btn) {
-        await btn.click({ force: true });
-        return;
-      }
-      await this.page.waitForTimeout(300);
-    }
-    throw new Error('Send button not found or not enabled');
+    // Verify send is enabled
+    const sendEnabled = await this.page.evaluate(() => {
+      const btn = document.querySelector('button[aria-label="Send"]');
+      return btn ? !(btn as HTMLButtonElement).disabled : false;
+    });
+    if (!sendEnabled) throw new Error('Send button not enabled after typing');
+
+    // Click send via native Playwright mouse click
+    const sendCoords = await this.page.evaluate(() => {
+      const btn = document.querySelector('button[aria-label="Send"]');
+      if (!btn) return null;
+      const r = btn.getBoundingClientRect();
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    });
+    if (!sendCoords) throw new Error('Send button not found');
+    await this.page.mouse.click(sendCoords.x, sendCoords.y);
+
+    // Dismiss any overlays that may reappear
+    await this.page.waitForTimeout(2000);
+    await browserManager.removeOverlays();
   }
 
   async waitForResponse(timeout = 90000): Promise<string> {
@@ -103,23 +86,34 @@ export class PlaygroundPage {
     let stableCount = 0;
 
     while (Date.now() - start < timeout) {
-      // Check if stop button is still visible (response still streaming)
-      const stopBtn = await this.findFirst([
-        'button[aria-label*="stop" i]',
-        'button[aria-label*="إيقاف" i]',
-      ]);
-      const isStreaming = stopBtn && await stopBtn.isVisible().catch(() => false);
+      // Dismiss overlays periodically
+      if ((Date.now() - start) % 15000 < 1000) {
+        await browserManager.removeOverlays();
+      }
+
+      // Check if still streaming
+      const streaming = await this.page.evaluate(() => {
+        // Check for loading indicators
+        const loadingBars = document.querySelectorAll('[class*="loading"], [class*="spinner"], [class*="thinking"], [class*="nv-streaming"], [class*="streaming"], [class*="skeleton"]');
+        if (loadingBars.length > 0) return true;
+        // Check for stop button
+        for (const b of Array.from(document.querySelectorAll('button'))) {
+          const l = (b.getAttribute('aria-label') || '').toLowerCase();
+          if (l.includes('stop') || l.includes('إيقاف') || l.includes('cancel')) return true;
+        }
+        return false;
+      });
 
       const currentText = await this.extractModelResponse();
 
-      if (isStreaming) {
+      if (streaming) {
         stableCount = 0;
         lastText = currentText;
         await this.page.waitForTimeout(500);
         continue;
       }
 
-      if (currentText && currentText === lastText) {
+      if (currentText && currentText.length > 200 && currentText === lastText) {
         stableCount++;
         if (stableCount >= 3) {
           console.error('[Playground] Response stable after %dms', Date.now() - start);
@@ -136,56 +130,31 @@ export class PlaygroundPage {
 
   private async extractModelResponse(): Promise<string> {
     try {
-      return await this.page.evaluate(() => {
-        // Look for response containers - NVIDIA uses specific patterns
-        const selectors = [
-          '[class*="response"]',
-          '[class*="message"]',
-          '[class*="assistant"]',
-          '[class*="output"]',
-          '[class*="answer"]',
-          '[class*="result"]',
-          '[data-testid*="response"]',
-          '[data-testid*="message"]',
-          '.markdown-body',
-          '.prose',
-        ];
-
-        // Get all elements that might contain responses
-        const candidates: Element[] = [];
-        for (const sel of selectors) {
-          document.querySelectorAll(sel).forEach(el => candidates.push(el));
-        }
-
-        // Find the last substantial text block (the latest response)
-        let bestText = '';
-        for (const el of candidates) {
-          const text = (el as HTMLElement).innerText?.trim();
-          if (text && text.length > 5 && !text.includes('GOVERNING TERMS')) {
-            if (text.length > bestText.length) {
-              bestText = text;
-            }
+      const sentMsg = this.lastSentMessage;
+      return await this.page.evaluate((sentMsg) => {
+        // Method 1: Look for rendered markdown in response blocks
+        const mdBlocks = document.querySelectorAll('.markdown-body, .prose, [class*="response-content"], [class*="message-content"]');
+        let lastResponse = '';
+        for (const md of Array.from(mdBlocks)) {
+          const t = (md as HTMLElement).innerText?.trim();
+          if (t && t.length > 200 && !t.includes('GOVERNING') && !t.includes('Accept All') && !t.includes('please do not upload')) {
+            lastResponse = t;
           }
         }
+        if (lastResponse) return lastResponse;
 
-        // Also try to get text after "Reasoning Complete" or similar markers
-        const allText = document.body.innerText;
-        const markers = ['Reasoning Complete', 'Response', 'Answer', 'Result'];
-        for (const marker of markers) {
-          const idx = allText.lastIndexOf(marker);
-          if (idx > 0) {
-            const afterMarker = allText.substring(idx + marker.length).trim();
-            // Get lines after the marker, skip empty lines
-            const lines = afterMarker.split('\n').filter(l => l.trim() && !l.includes('Tools') && !l.includes('Parameters') && !l.includes('GOVERNING'));
-            const responseText = lines.slice(0, 20).join('\n').trim();
-            if (responseText.length > bestText.length) {
-              bestText = responseText;
-            }
+        // Method 2: Look for substantial text blocks after user message
+        const allBlocks = document.querySelectorAll('div, p, span');
+        let foundUserMsg = false;
+        for (const block of Array.from(allBlocks)) {
+          const t = (block as HTMLElement).innerText?.trim();
+          if (t?.includes(sentMsg?.substring(0, 30) || 'NEVER_MATCH')) { foundUserMsg = true; continue; }
+          if (foundUserMsg && t && t.length > 200 && !t.includes('GOVERNING') && !t.includes('Accept All') && !t.includes('please do not upload') && !t.includes('Refine your idea')) {
+            return t;
           }
         }
-
-        return bestText;
-      }) as string;
+        return '';
+      }, sentMsg) as string;
     } catch {
       return '';
     }

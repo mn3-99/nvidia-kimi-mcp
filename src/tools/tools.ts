@@ -47,7 +47,7 @@ export const toolDefs: Array<{
     schema: { path: z.string().optional().describe('Save path') },
     handler: async (args) => {
       const buf = await getPage().takeScreenshot(args.path);
-      return { success: true, size: buf.length };
+      return { success: true, size: buf.length, data: buf.toString('base64') };
     },
   },
 ];

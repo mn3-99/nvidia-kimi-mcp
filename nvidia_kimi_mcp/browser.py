@@ -42,6 +42,88 @@ Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
 window.chrome = window.chrome || { runtime: {} };
 """
 
+# In-page streaming tap: wraps window.fetch *before* the app loads and tees
+# every Server-Sent-Events chunk of the inference call into a live,
+# poll-friendly structure (window.__NV_STREAM__).  This is what lets us watch
+# Kimi think (reasoning_content) and answer (content) token-by-token, with
+# counters, latency and usage — at wire speed, with zero DOM churn.
+_STREAM_TAP_JS = """
+(() => {
+  const HINT = '/v2/predict/models/';
+  const QUEUE = '/predict/queues/';
+  const store = () => (window.__NV_STREAM__ = window.__NV_STREAM__ || { seq: 0, history: [] });
+  const origFetch = window.fetch.bind(window);
+  window.fetch = async function (input, init) {
+    const url = typeof input === 'string' ? input : ((input && input.url) || '');
+    const resp = await origFetch(input, init);
+    try {
+      if (url.includes(HINT) && !url.includes(QUEUE)) {
+        const s = store();
+        const rec = {
+          id: ++s.seq, url, started: Date.now(), updated: Date.now(), done: false,
+          error: null, status: resp.status,
+          request: (init && init.body) ? String(init.body).slice(0, 8000) : null,
+          content: '', reasoning: '', usage: null, finish: null,
+        };
+        s.current = rec;
+        s.history.push(rec);
+        if (s.history.length > 30) s.history = s.history.slice(-20);
+        const ct = resp.headers.get('content-type') || '';
+        if (ct.includes('event-stream')) {
+          const clone = resp.clone();
+          (async () => {
+            try {
+              const reader = clone.body.getReader();
+              const dec = new TextDecoder();
+              let buf = '';
+              for (;;) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                buf += dec.decode(value, { stream: true });
+                let idx;
+                while ((idx = buf.indexOf('\\n\\n')) >= 0) {
+                  const ev = buf.slice(0, idx); buf = buf.slice(idx + 2);
+                  for (const line of ev.split('\\n')) {
+                    if (!line.startsWith('data:')) continue;
+                    const data = line.slice(5).trim();
+                    if (!data || data === '[DONE]') continue;
+                    try {
+                      const j = JSON.parse(data);
+                      if (j.usage) rec.usage = j.usage;
+                      const c = (j.choices && j.choices[0]) || {};
+                      if (c.delta && typeof c.delta.content === 'string') rec.content += c.delta.content;
+                      if (c.delta && typeof c.delta.reasoning_content === 'string') rec.reasoning += c.delta.reasoning_content;
+                      if (c.finish_reason) rec.finish = c.finish_reason;
+                      rec.updated = Date.now();
+                    } catch (e) { /* keep streaming */ }
+                  }
+                }
+              }
+              rec.done = true; rec.updated = Date.now();
+            } catch (e) { rec.error = String(e); rec.done = true; rec.updated = Date.now(); }
+          })();
+        } else {
+          resp.clone().text()
+            .then(t => {
+              try {
+                const j = JSON.parse(t);
+                const c = (j.choices && j.choices[0]) || {};
+                rec.content = (c.message && c.message.content) || '';
+                rec.reasoning = (c.message && c.message.reasoning_content) || '';
+                rec.finish = c.finish_reason || null;
+                rec.usage = j.usage || null;
+              } catch (_) { rec.content = t.slice(0, 200000); }
+              rec.done = true; rec.updated = Date.now();
+            })
+            .catch(e => { rec.error = String(e); rec.done = true; rec.updated = Date.now(); });
+        }
+      }
+    } catch (e) { /* never break the page */ }
+    return resp;
+  };
+})();
+"""
+
 # One DOM-evaluated dismissal pass.  Returns a state token.
 _DISMISS_JS = """() => {
   const vis = el => { if (!el) return false; const r = el.getBoundingClientRect();
@@ -166,8 +248,10 @@ class BrowserManager:
 
         self.context = await self.browser.new_context(**ctx_kwargs)
         self.context.set_default_timeout(settings.action_timeout_ms)
+        # network-level tap (response bodies, exact payloads)
         self.page = await self.context.new_page()
         await self.page.add_init_script(_STEALTH_JS)
+        await self.page.add_init_script(_STREAM_TAP_JS)
         self.tap = NetworkTap()
         self.tap.attach(self.page)
         self.page.on("crash", lambda _p: logger.error("page crashed"))

@@ -5,17 +5,34 @@ const USER_AGENTS = [
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
 ];
 
-const MODAL_SELECTORS = [
-  '#onetrust-accept-btn-handler',
-  'button.save-preference-btn-handler',
-  'button:has-text("Accept All")',
-  '[role="dialog"] button:first-child',
-  'button[aria-label="Close"]',
-  'button[aria-label="إغلاق"]',
-  '.modal-close',
-  'button[id*="accept"]',
-  'button[class*="cookie"]',
-];
+async function nativeClick(page: Page, text: string): Promise<boolean> {
+  const coords = await page.evaluate((text) => {
+    const btns = Array.from(document.querySelectorAll('button'));
+    const btn = btns.find(b => b.textContent?.includes(text));
+    if (!btn) return null;
+    const r = btn.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  }, text);
+  if (coords) {
+    await page.mouse.click(coords.x, coords.y);
+    return true;
+  }
+  return false;
+}
+
+async function dismissOverlays(page: Page): Promise<void> {
+  // Remove cookie consent + AI modal + all overlays via DOM removal
+  await page.evaluate(() => {
+    document.querySelectorAll('[class*="cookie"], [class*="consent"], [id*="onetrust"], [class*="onetrust"]').forEach(el => el.remove());
+    document.querySelectorAll('[class*="backdrop"], [class*="z-40"], [class*="z-50"]').forEach(el => el.remove());
+    document.querySelectorAll('button').forEach(btn => {
+      const text = btn.textContent?.trim().toLowerCase();
+      if (text === 'accept all' || text === 'save and accept' || text?.includes('acknowledge')) {
+        btn.click();
+      }
+    });
+  }).catch(() => {});
+}
 
 export class BrowserManager {
   private browser: Browser | null = null;
@@ -63,38 +80,28 @@ export class BrowserManager {
       timeout: 60000,
     });
 
-    await this.closeModals();
-    try {
-      await this.page.waitForTimeout(3000);
-    } catch {}
-    await this.closeModals();
+    // Phase 1: Accept cookies via native Playwright mouse click
+    console.error('[Browser] Accepting cookies...');
+    await nativeClick(this.page, 'Accept All');
+    await this.page.waitForTimeout(2000);
+
+    // Phase 2: Acknowledge AI modal via native Playwright mouse click
+    console.error('[Browser] Acknowledging AI modal...');
+    await nativeClick(this.page, 'Acknowledge & Continue');
+    await this.page.waitForTimeout(5000);
+    await this.page.waitForLoadState('networkidle').catch(() => {});
+    await this.page.waitForTimeout(2000);
+
+    // Phase 3: Remove leftover overlays
+    await dismissOverlays(this.page);
+    console.error('[Browser] Overlays cleared');
 
     return this.page;
   }
 
-  async closeModals(): Promise<void> {
+  async removeOverlays(): Promise<void> {
     if (!this.page) return;
-    // Click all known accept/dismiss buttons
-    for (const sel of MODAL_SELECTORS) {
-      try {
-        const els = await this.page.$$(sel);
-        for (const el of els) {
-          if (await el.isVisible()) {
-            await el.click({ timeout: 2000, force: true }).catch(() => {});
-            await this.page.waitForTimeout(500);
-          }
-        }
-      } catch {}
-    }
-    // Click "Review Terms" button if present
-    await this.page.click('button:has-text("Review Terms")', { force: true, timeout: 3000 }).catch(() => {});
-    // Remove overlay divs that intercept pointer events
-    await this.page.evaluate(() => {
-      document.querySelectorAll('[class*="backdrop-blur"], [class*="z-40"], [class*="overlay"]').forEach(el => {
-        if (el instanceof HTMLElement && el.style.position === 'absolute') el.remove();
-      });
-    }).catch(() => {});
-    await this.page.keyboard.press('Escape').catch(() => {});
+    await dismissOverlays(this.page);
   }
 
   getPage(): Page {
