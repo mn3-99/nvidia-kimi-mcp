@@ -19,11 +19,12 @@ export const toolDefs: Array<{
     schema: {
       message: z.string().describe('The message to send'),
       waitForResponse: z.boolean().default(true).describe('Wait for response to complete'),
-      timeout: z.number().default(90).describe('Max wait time in seconds'),
+      timeout: z.number().default(300).describe('Max wait time in seconds'),
+      mode: z.enum(['auto', 'direct', 'ui']).default('auto').describe('auto=Direct API first, UI fallback; direct=native API only; ui=vision UI automation only'),
     },
     handler: async (args) => {
       const page = getPage();
-      await page.sendMessage(args.message);
+      await page.sendMessage(args.message, args.mode || 'auto');
       if (args.waitForResponse !== false) {
         const timeout = (args.timeout || 90) * 1000;
         const response = await page.waitForResponse(timeout);
