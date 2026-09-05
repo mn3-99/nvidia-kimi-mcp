@@ -3,12 +3,14 @@
   "version": "1.0.0",
   "type": "module",
   "main": "dist/src/server/index.js",
-  "scripts": {
+"scripts": {
     "build": "tsc",
-    "start": "node dist/src/server/index.js",
+    "start": "node dist/index.js",
+    "proxy": "node dist/openai-proxy.js",
+    "proxy:dev": "tsx watch src/openai-proxy.ts",
     "dev": "tsx watch src/server/index.ts",
     "test": "tsx src/test.ts",
-    "inspect": "npx @modelcontextprotocol/inspector node dist/src/server/index.js"
+    "inspect": "npx @modelcontextprotocol/inspector node dist/index.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
